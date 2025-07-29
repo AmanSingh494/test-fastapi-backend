@@ -18,6 +18,9 @@ from llm import get_inference, get_inference_stream
 from sarvamai import AsyncSarvamAI, AudioOutput
 from sarvam import tts_stream_from_text, send_sarvam_pings
 import base64  
+import time
+
+from performance_monitor import perf_monitor
 
 load_dotenv()
 # Initialize FastAPI app
@@ -170,7 +173,7 @@ async def handle_deepgram_utterance_end(utterance_end, **kwargs):
         logger.error(f"Error handling Deepgram utterance end for {frontend_ws_id}: {e}")
 
 
-
+@perf_monitor.timing_decorator("deepgram_connection_create")
 def create_deepgram_connection(frontend_ws_id: str):
     """Create a Deepgram connection for real-time transcription"""
     try:
@@ -327,6 +330,9 @@ async def close_sarvam_connection(frontend_ws_id: str):
     
     logger.info(f"Completed Sarvam connection cleanup for {frontend_ws_id}")
 
+
+
+@perf_monitor.timing_decorator("sarvam_connection_create")
 async def create_sarvam_connection(frontend_ws_id: str):
     """Create a Sarvam AI TTS connection"""
     try:
@@ -371,6 +377,7 @@ async def async_text_generator(text: str):
     """Convert string to async generator for TTS"""
     yield text
 
+@perf_monitor.timing_decorator("utterance_processing_full")
 async def process_utterance_with_tts(frontend_ws_id: str, full_transcript: str):
     """Process utterance with LLM and TTS in background task"""
     try:
@@ -395,7 +402,15 @@ async def process_utterance_with_tts(frontend_ws_id: str, full_transcript: str):
 
         # Get LLM response
         logger.info(f"Getting LLM response for: '{full_transcript}'")
+         # Your existing code with timing points
+    
+        utterance_start = time.time()
+        print(f"🎯 Starting utterance processing: '{full_transcript}'")
+    
+        llm_start = time.time()
         llm_res = get_inference_stream(full_transcript, frontend_ws=frontend_ws)
+        llm_time = time.time() - llm_start
+        print(f"📝 LLM response time: {llm_time*1000:.1f}ms")
 
         # Send LLM response to frontend first
         await frontend_ws.send_json({
@@ -406,6 +421,7 @@ async def process_utterance_with_tts(frontend_ws_id: str, full_transcript: str):
         # Now process TTS with timeout
         logger.info(f"Starting TTS processing for {frontend_ws_id}")
         try:
+            tts_start = time.time()
             # Add timeout to TTS processing
             audio_chunks = await asyncio.wait_for(
                 tts_stream_from_text(
@@ -417,6 +433,11 @@ async def process_utterance_with_tts(frontend_ws_id: str, full_transcript: str):
                 timeout=30.0  # 30 second timeout
             )
             logger.info(f"TTS completed for {frontend_ws_id}: {len(audio_chunks)} chunks")
+            tts_time = time.time() - tts_start
+            print(f"🎵 TTS processing time: {tts_time*1000:.1f}ms")
+    
+            total_time = time.time() - utterance_start
+            print(f"🏁 Total utterance processing: {total_time*1000:.1f}ms")
             
         except asyncio.TimeoutError:
             logger.error(f"TTS processing timed out for {frontend_ws_id}")
@@ -435,7 +456,7 @@ async def process_utterance_with_tts(frontend_ws_id: str, full_transcript: str):
         await frontend_ws.send_json({
             "type": "processing_complete",
             "utterance": full_transcript,
-            "llm": llm_res
+            # "llm": llm_res
         })
         
     except Exception as e:
@@ -726,3 +747,14 @@ async def websocket_endpoint(websocket: WebSocket):
             logger.info(f"Removed frontend WebSocket from state map for {frontend_ws_id}")
         
         logger.info(f"WebSocket cleanup initiated for {frontend_ws_id} (background task running)")
+
+
+
+# Add performance endpoint
+@app.get("/performance/stats")
+async def get_performance_stats():
+    return {
+        "summary": perf_monitor.get_performance_summary(),
+        "recent_logs": perf_monitor.detailed_logs[-50:],  # Last 50 operations
+        "timestamp": datetime.now().isoformat()
+    }

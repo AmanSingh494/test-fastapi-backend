@@ -5,6 +5,8 @@ import websockets
 from dotenv import load_dotenv
 load_dotenv()
 import os
+# Add this to your main.py imports
+from performance_monitor import perf_monitor
 
 SARVAM_API_KEY=os.getenv('SARVAM_API_KEY')
 
@@ -33,6 +35,7 @@ async def check_sarvam_connection_health(sarvam_ws):
         print(f"Error checking Sarvam connection health: {e}")
         return False
     
+@perf_monitor.timing_decorator("tts_processing")
 async def tts_stream_from_text(text_stream, frontend_ws=None, sarvam_ws=None, task_id=None):
     """
     Convert streaming text to audio and optionally send to frontend via websocket
@@ -66,7 +69,7 @@ async def tts_stream_from_text(text_stream, frontend_ws=None, sarvam_ws=None, ta
 
         async for text_chunk in text_stream:
             if text_chunk:
-                print(f"📥 Received text chunk: '{text_chunk}' ({len(text_chunk)} chars)")
+                # print(f"📥 Received text chunk: '{text_chunk}' ({len(text_chunk)} chars)")
                 text_buffer += text_chunk
                 full_text += text_chunk
                 
