@@ -1,5 +1,7 @@
 # main.py
 import asyncio
+from asyncio import Queue
+from typing import AsyncGenerator, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 import json
@@ -19,23 +21,34 @@ from sarvamai import AsyncSarvamAI, AudioOutput
 from sarvam import tts_stream_from_text, send_sarvam_pings
 import base64  
 import time
-
+from dataclasses import dataclass
 from performance_monitor import perf_monitor
 
 load_dotenv()
 # Initialize FastAPI app
 app = FastAPI()
 
+    
 app.state.frontend_ws_map = {} # Maps frontend_ws_id to the actual WebSocket object
 app.state.deepgram_connections = {} # Maps frontend_ws_id to Deepgram connection
 app.state.sarvam_connections = {} # Maps frontend_ws_id to sarvam AI TTS connection
 app.state.sarvam_clients = {} # Maps frontend_ws_id to sarvam AI client
 app.state.sarvam_context_managers = {} # Maps frontend_ws_id to sarvam AI context manager
-app.state.connection_tasks = {} 
+# app.state.connection_tasks = {} 
 app.state.tts_tasks = {}
-
+app.state.tts_queues = {}  # Maps frontend_ws_id to request queue
+app.state.tts_processors = {}  # Maps frontend_ws_id to processor task
+app.state.sarvam_ping_tasks = {}  # Maps frontend_ws_id to ping task
 current_utterance_transcript = []
 utterance_lock = threading.Lock() 
+
+@dataclass
+class TTSRequest:
+    user_input: str
+    task_id: str
+    frontend_ws_id: str
+    cancelled: bool = False
+    processing_start_time: Optional[float] = None
 
 # Configure logging for better visibility in the console
 logging.basicConfig(level=logging.INFO)
@@ -49,6 +62,7 @@ if not DEEPGRAM_API_KEY:
 
 if not SARVAM_API_KEY:
     logger.error("SARVAM_API_KEY not found in environment variables. Please set it in your .env file.")
+
 
 async def handle_deepgram_message(result, **kwargs):
     """Handle messages from Deepgram"""
@@ -67,26 +81,37 @@ async def handle_deepgram_message(result, **kwargs):
 
         if len(sentence) == 0:
             return
-        if frontend_ws_id in app.state.tts_tasks:
-            tts_task = app.state.tts_tasks[frontend_ws_id]
-            if not tts_task.done():
-                logger.info(f"🛑 INTERRUPTING: Ongoing TTS detected, user is speaking")
-                await frontend_ws.send_json({
-                    "type": 'audio_interrupt'
-                })
-
-                # Cancel the current TTS task
-                tts_task.cancel()
-                try:
-                    await asyncio.wait_for(tts_task, timeout=1.0)
-                    logger.info(f"TTS task interrupted successfully for {frontend_ws_id}")
-                except asyncio.CancelledError:
-                    logger.info(f"TTS task was cancelled for {frontend_ws_id}")
-                except asyncio.TimeoutError:
-                    logger.warning(f"TTS task cancellation timed out for {frontend_ws_id}")
-                except Exception as e:
-                    logger.error(f"Error cancelling TTS task for {frontend_ws_id}: {e}")
+        
         if(sentence and is_final):
+            if len(sentence.strip()) > 2:  # Significant speech detected
+            # Cancel pending TTS requests
+                # await cancel_pending_tts_requests(frontend_ws_id)
+            
+                if frontend_ws_id in app.state.tts_tasks:
+                    tts_task = app.state.tts_tasks[frontend_ws_id]
+                    if not tts_task.done():
+                        logger.info(f"🛑 INTERRUPTING: Ongoing TTS detected, user is speaking")
+                        await frontend_ws.send_json({
+                            "type": 'audio_interrupt'
+                        })
+
+                        # Cancel the current TTS task
+                        tts_task.cancel()
+                        try:
+                            await asyncio.wait_for(tts_task, timeout=1.0)
+                            logger.info(f"TTS task interrupted successfully for {frontend_ws_id}")
+                        except asyncio.CancelledError:
+                            logger.info(f"TTS task was cancelled for {frontend_ws_id}")
+                        except asyncio.TimeoutError:
+                            logger.warning(f"TTS task cancellation timed out for {frontend_ws_id}")
+                        except Exception as e:
+                            logger.error(f"Error cancelling TTS task for {frontend_ws_id}: {e}")
+                            
+                        await frontend_ws.send_json({
+                            "type": 'audio_interrupt',
+                            "detected_speech": sentence
+                })
+                    logger.info(f"🛑 INTERRUPTING: Detected speech '{sentence}' for {frontend_ws_id}")
             # Lock to safely update the current utterance transcript
             with utterance_lock:
                 current_utterance_transcript.append(sentence)
@@ -125,7 +150,7 @@ async def handle_deepgram_utterance_end(utterance_end, **kwargs):
     try:
         frontend_ws_id = kwargs.get('frontend_ws_id')
         frontend_ws = app.state.frontend_ws_map.get(frontend_ws_id)
-        
+        processing_start_time = time.time()
         if not frontend_ws:
             logger.error(f"Frontend WS not found for {frontend_ws_id}")
             return
@@ -137,41 +162,29 @@ async def handle_deepgram_utterance_end(utterance_end, **kwargs):
         if not full_transcript:
             logger.warning(f"Received empty utterance end for {frontend_ws_id}")
             return
-        
-        logger.info(f"Processing utterance: '{full_transcript}' for {frontend_ws_id}")
-        if frontend_ws_id in app.state.tts_tasks:
-                old_task = app.state.tts_tasks[frontend_ws_id]
-                if not old_task.done():
-                    logger.info(f"Cancelling previous TTS task for {frontend_ws_id}")
-                    old_task.cancel()
-                    try:
-                        # Wait for the cancellation to complete with timeout
-                        await asyncio.wait_for(old_task, timeout=2.0)
-                        logger.info(f"Previous TTS task cancelled successfully for {frontend_ws_id}")
-                    except asyncio.CancelledError:
-                        logger.info(f"Previous TTS task was cancelled for {frontend_ws_id}")
-                    except asyncio.TimeoutError:
-                        logger.warning(f"Previous TTS task cancellation timed out for {frontend_ws_id}")
-                    except Exception as e:
-                        logger.error(f"Error cancelling previous TTS task for {frontend_ws_id}: {e}")  
-        # Send utterance to frontend immediately
-        await frontend_ws.send_json({
-            "type": "utterance_end",
-            "text": full_transcript,
-            "message": "Processing your request..."
-        })
+ 
+        try:
+            logger.info(f"Processing utterance end: '{full_transcript}' for {frontend_ws_id} at {time.time()*1000:.1f}ms")
+            await frontend_ws.send_json({
+                "type": "utterance_end",
+                "text": full_transcript,
+                "message": "Processing your request..."
+            })
+        except Exception:
+            logger.warning(f"Could not send utterance_end message to {frontend_ws_id} - frontend may be disconnected")
+            return
         
         # Queue TTS processing as a background task (don't await it here!)
         tts_task = asyncio.create_task(
-            process_utterance_with_tts(frontend_ws_id, full_transcript)
+            process_utterance_with_tts(frontend_ws_id, full_transcript,processing_start_time)
         )
 
         app.state.tts_tasks[frontend_ws_id] = tts_task
-        logger.info(f"Queued TTS processing task for {frontend_ws_id}")
+        logger.info(f"Created TTS + LLM processing task for {frontend_ws_id}")
+
 
     except Exception as e:
         logger.error(f"Error handling Deepgram utterance end for {frontend_ws_id}: {e}")
-
 
 @perf_monitor.timing_decorator("deepgram_connection_create")
 def create_deepgram_connection(frontend_ws_id: str):
@@ -190,7 +203,7 @@ def create_deepgram_connection(frontend_ws_id: str):
             language="hi",
             smart_format=True,
             interim_results=True,
-            utterance_end_ms=1500,
+            utterance_end_ms=1111
         )
         
         logger.info(f"Starting Deepgram connection with options: {options}")
@@ -261,12 +274,43 @@ def create_deepgram_connection(frontend_ws_id: str):
     except Exception as e:
         logger.error(f"Exception in create_deepgram_connection for {frontend_ws_id}: {e}", exc_info=True)
         return None
+
 async def close_sarvam_connection(frontend_ws_id: str):
     """Properly close the Sarvam AI connection"""
     logger.info(f"Starting Sarvam connection cleanup for {frontend_ws_id}")
     
     try:
-        # Close the context manager first (most important)
+        # Cancel ping task first
+        if hasattr(app.state, 'sarvam_ping_tasks') and frontend_ws_id in app.state.sarvam_ping_tasks:
+            ping_task = app.state.sarvam_ping_tasks[frontend_ws_id]
+            logger.info(f"Found Sarvam ping task for {frontend_ws_id}, attempting to cancel...")
+            try:
+                if not ping_task.done():
+                    ping_task.cancel()
+                    logger.info(f"Cancelled Sarvam ping task for {frontend_ws_id}")
+                    try:
+                        # Wait for the cancellation to complete with timeout
+                        await asyncio.wait_for(ping_task, timeout=2.0)
+                        logger.info(f"Sarvam ping task cancelled successfully for {frontend_ws_id}")
+                    except asyncio.CancelledError:
+                        logger.info(f"Sarvam ping task was cancelled for {frontend_ws_id}")
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Sarvam ping task cancellation timed out for {frontend_ws_id}")
+                else:
+                    logger.info(f"Sarvam ping task already completed for {frontend_ws_id}")
+            except Exception as e:
+                logger.error(f"Error cancelling Sarvam ping task for {frontend_ws_id}: {e}")
+            
+            # Remove from state even if cancellation failed
+            try:
+                del app.state.sarvam_ping_tasks[frontend_ws_id]
+                logger.info(f"Removed Sarvam ping task from state for {frontend_ws_id}")
+            except KeyError:
+                logger.warning(f"Sarvam ping task already removed for {frontend_ws_id}")
+        else:
+            logger.info(f"No Sarvam ping task found for {frontend_ws_id}")
+        
+        # Close the context manager (most important)
         if hasattr(app.state, 'sarvam_context_managers') and frontend_ws_id in app.state.sarvam_context_managers:
             context_manager = app.state.sarvam_context_managers[frontend_ws_id]
             logger.info(f"Found Sarvam context manager for {frontend_ws_id}, attempting to close...")
@@ -330,8 +374,6 @@ async def close_sarvam_connection(frontend_ws_id: str):
     
     logger.info(f"Completed Sarvam connection cleanup for {frontend_ws_id}")
 
-
-
 @perf_monitor.timing_decorator("sarvam_connection_create")
 async def create_sarvam_connection(frontend_ws_id: str):
     """Create a Sarvam AI TTS connection"""
@@ -356,7 +398,8 @@ async def create_sarvam_connection(frontend_ws_id: str):
         app.state.sarvam_clients[frontend_ws_id] = client
         
         # Comment out ping task for now since send_sarvam_pings might not be implemented
-        # ping_task = asyncio.create_task(send_sarvam_pings(ws_connection))
+        ping_task = asyncio.create_task(send_sarvam_pings(ws_connection))
+        app.state.sarvam_ping_tasks[frontend_ws_id] = ping_task
         logger.info(f"Created Sarvam AI connection for {frontend_ws_id}")
         return ws_connection
     
@@ -373,12 +416,13 @@ async def create_sarvam_connection(frontend_ws_id: str):
         except Exception as cleanup_error:
             logger.error(f"Error during Sarvam connection cleanup: {cleanup_error}")
         return None
+
 async def async_text_generator(text: str):
     """Convert string to async generator for TTS"""
     yield text
 
 @perf_monitor.timing_decorator("utterance_processing_full")
-async def process_utterance_with_tts(frontend_ws_id: str, full_transcript: str):
+async def process_utterance_with_tts(frontend_ws_id: str, full_transcript: str,processing_start_time = None):
     """Process utterance with LLM and TTS in background task"""
     try:
         current_task = asyncio.current_task()
@@ -428,157 +472,156 @@ async def process_utterance_with_tts(frontend_ws_id: str, full_transcript: str):
                     text_stream=llm_res, 
                     frontend_ws=frontend_ws, 
                     sarvam_ws=sarvam_ws,
-                    task_id=task_id
+                    task_id=task_id,
+                    tts_start=tts_start,
+                    processing_start_time = processing_start_time
                 ),
                 timeout=30.0  # 30 second timeout
             )
-            logger.info(f"TTS completed for {frontend_ws_id}: {len(audio_chunks)} chunks")
+            logger.info(f"TTS : {task_id} completed for {frontend_ws_id}: {len(audio_chunks)} chunks")
             tts_time = time.time() - tts_start
             print(f"🎵 TTS processing time: {tts_time*1000:.1f}ms")
     
             total_time = time.time() - utterance_start
             print(f"🏁 Total utterance processing: {total_time*1000:.1f}ms")
-            
+        
+        except asyncio.CancelledError:
+            # Handle cancellation properly (don't treat as error)
+            logger.info(f"🛑 TTS task {task_id} was cancelled for {frontend_ws_id}")
+            # Don't send error message for cancellation - it's expected behavior
+            raise
+
         except asyncio.TimeoutError:
             logger.error(f"TTS processing timed out for {frontend_ws_id}")
-            await frontend_ws.send_json({
-                "type": "error",
-                "message": "TTS processing timed out"
-            })
+            if frontend_ws and hasattr(frontend_ws, 'client_state') and frontend_ws.client_state.value == 1:
+                await frontend_ws.send_json({
+                    "type": "error",
+                    "message": "TTS processing timed out"
+                })
         except Exception as tts_error:
             logger.error(f"TTS processing failed for {frontend_ws_id}: {tts_error}")
-            await frontend_ws.send_json({
-                "type": "error",
-                "message": f"TTS processing failed: {str(tts_error)}"
-            })
-            
-        # Send final completion message
-        await frontend_ws.send_json({
-            "type": "processing_complete",
-            "utterance": full_transcript,
-            # "llm": llm_res
-        })
+            if frontend_ws and hasattr(frontend_ws, 'client_state') and frontend_ws.client_state.value == 1:
+                await frontend_ws.send_json({
+                    "type": "error",
+                    "message": f"TTS processing failed: {str(tts_error)}"
+                })
         
     except Exception as e:
         logger.error(f"Error in TTS processing task for {frontend_ws_id}: {e}")
         if frontend_ws_id in app.state.frontend_ws_map:
             frontend_ws = app.state.frontend_ws_map[frontend_ws_id]
-            await frontend_ws.send_json({
-                "type": "error",
-                "message": f"Processing failed: {str(e)}"
-            })
+            if frontend_ws and hasattr(frontend_ws, 'client_state') and frontend_ws.client_state.value == 1:
+                await frontend_ws.send_json({
+                    "type": "error",
+                    "message": f"Processing failed: {str(e)}"
+                })
 
-
-async def setup_connections_background(frontend_ws_id: str, websocket: WebSocket):
-    """Background task to set up Deepgram and Sarvam connections"""
+async def cleanup_connections_direct(frontend_ws_id: str):
+    """Direct cleanup in main thread - continue cleanup even if individual steps fail"""
+    logger.info(f"Starting direct cleanup for {frontend_ws_id}")
+    
+    cleanup_results = {
+        "tts_tasks": False,
+        "tts_processors": False,
+        "deepgram": False,
+        "sarvam": False,
+        "frontend_ws": False
+    }
+    
+    # 1. Cancel any running TTS tasks (legacy) - INDEPENDENT CLEANUP
     try:
-        logger.info(f"Starting background connection setup for {frontend_ws_id}")
-        
-        # Create Deepgram connection
-        logger.info(f"Creating Deepgram connection for {frontend_ws_id}")
-        dg_connection = create_deepgram_connection(frontend_ws_id)
-        if not dg_connection:
-            await websocket.send_json({
-                "type": "error",
-                "message": "Failed to connect to Deepgram."
-            })
-            logger.error(f"Failed to connect to Deepgram for frontend {frontend_ws_id}")
-            return False
-            
-        # Create Sarvam connection
-        logger.info(f"Creating Sarvam connection for {frontend_ws_id}")
-        sarvam_connection = await create_sarvam_connection(frontend_ws_id)
-        if not sarvam_connection:
-            await websocket.send_json({
-                "type": "error", 
-                "message": "Failed to connect to Sarvam AI TTS."
-            })
-            logger.error(f"Failed to connect to Sarvam AI for frontend {frontend_ws_id}")
-            # Clean up Deepgram if Sarvam fails
-            if dg_connection:
-                try:
-                    dg_connection.finish()
-                except:
-                    pass
-            return False
-        
-        # Send success message
-        await websocket.send_json({
-            "type": "connections_ready",
-            "message": "All connections established successfully"
-        })
-        
-        logger.info(f"Background connection setup completed for {frontend_ws_id}")
-        return True
-        
-    except Exception as e:
-        logger.error(f"Error in background connection setup for {frontend_ws_id}: {e}")
-        await websocket.send_json({
-            "type": "error",
-            "message": f"Connection setup failed: {str(e)}"
-        })
-        return False
-
-async def cleanup_connections_background(frontend_ws_id: str):
-    """Background task to clean up connections"""
-    try:
-        logger.info(f"Starting background cleanup for {frontend_ws_id}")
         if hasattr(app.state, 'tts_tasks') and frontend_ws_id in app.state.tts_tasks:
             tts_task = app.state.tts_tasks[frontend_ws_id]
             if not tts_task.done():
                 logger.info(f"Cancelling running TTS task for {frontend_ws_id}")
                 tts_task.cancel()
                 try:
-                    await tts_task
+                    await asyncio.wait_for(tts_task, timeout=2.0)
+                    logger.info(f"TTS task cancelled successfully for {frontend_ws_id}")
                 except asyncio.CancelledError:
-                    pass
-            del app.state.tts_tasks[frontend_ws_id]
-        # Close Deepgram connection
-        if frontend_ws_id in app.state.deepgram_connections:
-            try:
-                dg_connection = app.state.deepgram_connections[frontend_ws_id]
-                dg_connection.finish()  # Synchronous method
-                del app.state.deepgram_connections[frontend_ws_id]
-                logger.info(f"Deepgram connection closed in background for {frontend_ws_id}")
-            except Exception as e:
-                logger.error(f"Error closing Deepgram connection in background for {frontend_ws_id}: {e}")
-
-        # Close Sarvam AI connection with timeout
-        try:
-            await asyncio.wait_for(
-                close_sarvam_connection(frontend_ws_id), 
-                timeout=10.0
-            )
-            logger.info(f"Sarvam cleanup completed in background for {frontend_ws_id}")
-        except asyncio.TimeoutError:
-            logger.error(f"Sarvam cleanup timed out in background for {frontend_ws_id}")
-            # Force cleanup
-            for state_key in ['sarvam_connections', 'sarvam_context_managers', 'sarvam_clients']:
-                if hasattr(app.state, state_key) and frontend_ws_id in getattr(app.state, state_key):
-                    try:
-                        del getattr(app.state, state_key)[frontend_ws_id]  # Fixed this line
-                    except:
-                        pass
-        except Exception as e:
-            logger.error(f"Error during Sarvam cleanup in background for {frontend_ws_id}: {e}")
-        
-        # Clean up state maps
-        for state_key in ['frontend_ws_map', 'pending_transcripts']:
-            if hasattr(app.state, state_key) and frontend_ws_id in getattr(app.state, state_key):
-                try:
-                    del getattr(app.state, state_key)[frontend_ws_id]
-                    logger.info(f"Cleaned up {state_key} for {frontend_ws_id}")
-                except:
-                    pass
-        
-        # Remove the cleanup task reference
-        if hasattr(app.state, 'connection_tasks') and frontend_ws_id in app.state.connection_tasks:
-            del app.state.connection_tasks[frontend_ws_id]
+                    logger.info(f"TTS task was cancelled for {frontend_ws_id}")
+                except asyncio.TimeoutError:
+                    logger.warning(f"TTS task cancellation timed out for {frontend_ws_id}")
+                except Exception as e:
+                    logger.error(f"Error waiting for TTS task cancellation for {frontend_ws_id}: {e}")
             
-        logger.info(f"Background cleanup completed for {frontend_ws_id}")
-        
+            # Always remove from state, even if cancellation failed
+            del app.state.tts_tasks[frontend_ws_id]
+            logger.info(f"Removed TTS task from state for {frontend_ws_id}")
+            cleanup_results["tts_tasks"] = True
     except Exception as e:
-        logger.error(f"Error in background cleanup for {frontend_ws_id}: {e}")
+        logger.error(f"Error in TTS task cleanup for {frontend_ws_id}: {e}")
+    
+    # 2. Cancel TTS processor - INDEPENDENT CLEANUP
+    try:
+        if hasattr(app.state, 'tts_processors') and frontend_ws_id in app.state.tts_processors:
+            processor_task = app.state.tts_processors[frontend_ws_id]
+            if not processor_task.done():
+                logger.info(f"Stopping TTS processor for {frontend_ws_id}")
+                # Send shutdown signal
+                try:
+                    if frontend_ws_id in app.state.tts_queues:
+                        await app.state.tts_queues[frontend_ws_id].put(None)
+                except Exception as queue_error:
+                    logger.error(f"Error sending shutdown signal to TTS queue for {frontend_ws_id}: {queue_error}")
+                
+                processor_task.cancel()
+                try:
+                    await asyncio.wait_for(processor_task, timeout=2.0)
+                    logger.info(f"TTS processor stopped successfully for {frontend_ws_id}")
+                except asyncio.CancelledError:
+                    logger.info(f"TTS processor was cancelled for {frontend_ws_id}")
+                except asyncio.TimeoutError:
+                    logger.warning(f"TTS processor stop timed out for {frontend_ws_id}")
+                except Exception as e:
+                    logger.error(f"Error stopping TTS processor for {frontend_ws_id}: {e}")
+            
+            # Always clean up processor state
+            if frontend_ws_id in app.state.tts_processors:
+                del app.state.tts_processors[frontend_ws_id]
+                logger.info(f"Removed TTS processor from state for {frontend_ws_id}")
+            if frontend_ws_id in app.state.tts_queues:
+                del app.state.tts_queues[frontend_ws_id]
+                logger.info(f"Removed TTS queue from state for {frontend_ws_id}")
+            cleanup_results["tts_processors"] = True
+    except Exception as e:
+        logger.error(f"Error in TTS processor cleanup for {frontend_ws_id}: {e}")
+    
+    # 3. Close Deepgram connection - INDEPENDENT CLEANUP
+    try:
+        if frontend_ws_id in app.state.deepgram_connections:
+            dg_connection = app.state.deepgram_connections[frontend_ws_id]
+            dg_connection.finish()  # Synchronous method
+            del app.state.deepgram_connections[frontend_ws_id]
+            logger.info(f"Deepgram connection closed for {frontend_ws_id}")
+            cleanup_results["deepgram"] = True
+    except Exception as e:
+        logger.error(f"Error closing Deepgram connection for {frontend_ws_id}: {e}")
+
+    # 4. Close Sarvam AI connection - INDEPENDENT CLEANUP
+    try:
+        await close_sarvam_connection(frontend_ws_id)
+        logger.info(f"Sarvam cleanup completed for {frontend_ws_id}")
+        cleanup_results["sarvam"] = True
+    except Exception as e:
+        logger.error(f"Error during Sarvam cleanup for {frontend_ws_id}: {e}")
+    
+    # 5. Remove from frontend map - INDEPENDENT CLEANUP
+    try:
+        if frontend_ws_id in app.state.frontend_ws_map:
+            del app.state.frontend_ws_map[frontend_ws_id]
+            logger.info(f"Removed frontend WebSocket from state map for {frontend_ws_id}")
+            cleanup_results["frontend_ws"] = True
+    except Exception as e:
+        logger.error(f"Error removing frontend WS from state for {frontend_ws_id}: {e}")
+    
+    # Log cleanup summary
+    successful_cleanups = sum(cleanup_results.values())
+    total_cleanups = len(cleanup_results)
+    logger.info(f"Direct cleanup completed for {frontend_ws_id}: {successful_cleanups}/{total_cleanups} steps successful")
+    
+    if successful_cleanups < total_cleanups:
+        logger.warning(f"Some cleanup steps failed for {frontend_ws_id}: {cleanup_results}")  
 
 @app.get("/")
 async def get():
@@ -587,6 +630,7 @@ async def get():
 # --- WebSocket Endpoint for Audio Streaming ---
 @app.websocket("/ws/audio")
 async def websocket_endpoint(websocket: WebSocket):
+    setup_start = time.time()
     await websocket.accept()
     logger.info("Frontend WebSocket connection accepted at /ws/audio")
     
@@ -598,12 +642,9 @@ async def websocket_endpoint(websocket: WebSocket):
     app.state.frontend_ws_map[frontend_ws_id] = websocket
 
     
-    # Connection status flags
-    connections_ready = False
-    
-    logger.info(f"Starting Deepgram real-time transcription for {frontend_ws_id}")
+    # logger.info(f"Starting Deepgram real-time transcription for {frontend_ws_id}")
     try:
-        # Check if API key is available
+    #     # Check if API key is available
         if not DEEPGRAM_API_KEY or not SARVAM_API_KEY:
             await websocket.send_json({
                 "type": "error",
@@ -611,31 +652,47 @@ async def websocket_endpoint(websocket: WebSocket):
             })
             return
 
-        # Start background connection setup
-        setup_task = asyncio.create_task(
-            setup_connections_background(frontend_ws_id, websocket)
-        )
-        app.state.connection_tasks[frontend_ws_id] = setup_task
+        # create deepgram and sarvam connections in main thread
+        dg_start = time.time()
+        dg_connection = create_deepgram_connection(frontend_ws_id)
+        dg_time = time.time() - dg_start
         
-        # Wait for connections to be ready (with timeout)
-        try:
-            connections_ready = await asyncio.wait_for(setup_task, timeout=30.0)
-        except asyncio.TimeoutError:
-            logger.error(f"Connection setup timed out for {frontend_ws_id}")
-            await websocket.send_json({
-                "type": "error",
-                "message": "Connection setup timed out"
-            })
+        if not dg_connection:
+            await websocket.send_json({"type": "error", "message": "Deepgram connection failed"})
+            return
+            
+        sarvam_start = time.time()
+        sarvam_connection = await create_sarvam_connection(frontend_ws_id)
+        sarvam_time = time.time() - sarvam_start
+        
+        if not sarvam_connection:
+            await websocket.send_json({"type": "error", "message": "Sarvam connection failed"})
+            dg_connection.finish()
+            del app.state.deepgram_connections[frontend_ws_id]
             return
         
-        if not connections_ready:
-            logger.error(f"Failed to establish connections for {frontend_ws_id}")
-            return
+        # Create persistent TTS processor (not using now)
+        # await create_persistent_tts_processor(frontend_ws_id)
+        # logger.info(f"Persistent TTS processor created for {frontend_ws_id}")
 
+        setup_time = time.time() - setup_start
+        logger.info(f"✅ Setup complete in {setup_time*1000:.1f}ms (DG: {dg_time*1000:.1f}ms, Sarvam: {sarvam_time*1000:.1f}ms)")
         
+        await websocket.send_json({
+            "type": "connections_ready",
+            "setup_time_ms": round(setup_time * 1000, 1)
+        })
+
         while True:
             message = await websocket.receive()
-            
+            message_type = message.get("type")
+                
+            if message_type == "websocket.disconnect":
+                    # Handle disconnect message properly
+                    disconnect_code = message.get("code", "unknown")
+                    disconnect_reason = message.get("reason", "")
+                    logger.info(f"WebSocket disconnect received for {frontend_ws_id} - Code: {disconnect_code}, Reason: '{disconnect_reason}'")
+                    break  # Exit the loop to trigger cleanup
             if "bytes" in message:
                 audio_chunk = message["bytes"]
                 # Log the size of the received audio chunk
@@ -675,7 +732,17 @@ async def websocket_endpoint(websocket: WebSocket):
                                 logger.info(f"Deepgram connection finished for {frontend_ws_id}")
                             except Exception as e:
                                 logger.error(f"Failed to finish Deepgram connection for {frontend_ws_id}: {e}")
-                        
+                        # Also close Sarvam connection when audio ends
+                            try:
+                                sarvam_ws = app.state.sarvam_connections.get(frontend_ws_id)
+                                if sarvam_ws:
+                                    # Flush any remaining TTS data and close connection
+                                    await sarvam_ws.flush()
+                                    logger.info(f"Flushed Sarvam connection for {frontend_ws_id}")
+                                    
+                            except Exception as e:
+                                logger.error(f"Error handling Sarvam connection during audio_end for {frontend_ws_id}: {e}")
+
                         logger.info(f"Audio stream ended for {frontend_ws_id}")
                     
                     elif data.get('type') == 'stop_transcription':
@@ -705,10 +772,12 @@ async def websocket_endpoint(websocket: WebSocket):
                         if not dg_connection:
                             dg_connection = create_deepgram_connection(frontend_ws_id)
                             if dg_connection:
+
                                 logger.info(f"New Deepgram connection established for {frontend_ws_id}")
                             else:
                                 await websocket.send_json({
                                     "type": "error", 
+
                                     "message": "Failed to establish Deepgram connection"
                                 })
                         else:
@@ -736,17 +805,14 @@ async def websocket_endpoint(websocket: WebSocket):
     finally:
         logger.info(f"Starting cleanup for {frontend_ws_id}")
 
-        # Start background cleanup task and don't wait for it
-        cleanup_task = asyncio.create_task(
-            cleanup_connections_background(frontend_ws_id)
-        )
+        
+        await cleanup_connections_direct(frontend_ws_id)
         
         # Remove from frontend map immediately
         if frontend_ws_id in app.state.frontend_ws_map:
             del app.state.frontend_ws_map[frontend_ws_id]
             logger.info(f"Removed frontend WebSocket from state map for {frontend_ws_id}")
         
-        logger.info(f"WebSocket cleanup initiated for {frontend_ws_id} (background task running)")
 
 
 

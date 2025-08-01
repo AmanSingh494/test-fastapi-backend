@@ -9,6 +9,7 @@ class PerformanceMonitor:
     def __init__(self):
         self.metrics: Dict[str, List[float]] = {}
         self.detailed_logs: List[Dict] = []
+        self.streaming_metrics: Dict[str, Dict] = {}
         
     def timing_decorator(self, operation_name: str):
         def decorator(func):
@@ -106,5 +107,27 @@ class PerformanceMonitor:
                 }
         return summary
 
+    def record_streaming_metric(self, connection_id: str, metric_name: str, value: float):
+        """Record a streaming metric for a specific connection"""
+        if connection_id not in self.streaming_metrics:
+            self.streaming_metrics[connection_id] = {}
+        
+        if metric_name not in self.streaming_metrics[connection_id]:
+            self.streaming_metrics[connection_id][metric_name] = []
+        
+        self.streaming_metrics[connection_id][metric_name].append({
+            'timestamp': time.time(),
+            'value': value
+        })
+        
+        # Keep only last 100 measurements per metric
+        if len(self.streaming_metrics[connection_id][metric_name]) > 100:
+            self.streaming_metrics[connection_id][metric_name].pop(0)
+    
+    def get_streaming_summary(self, connection_id: str = None) -> Dict:
+        """Get summary of streaming metrics"""
+        if connection_id:
+            return self.streaming_metrics.get(connection_id, {})
+        return self.streaming_metrics
 # Global instance
 perf_monitor = PerformanceMonitor()
